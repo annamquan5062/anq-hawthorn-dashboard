@@ -444,16 +444,19 @@ Object.assign(ADAPTERS, {
        recent window (keeps this/last month fresh and self-heals any gaps),
        plus one bounded older chunk per run, walking a persisted cursor
        further back each time until roughly a year+ of history is covered.
-       Uses a fixed default timezone for the day bucketing (a cron run has
-       no per-request venue timezone/rollover to hand) - a small
-       approximation that only affects the trend line and the not-yet-
-       backfilled older ranges; the reconciled current/recent numbers come
-       from the exact live fetchRange path whenever the day-store hasn't
-       caught up yet. */
+       Uses a fixed venue timezone for the day bucketing (a cron run has no
+       per-request tz/rollover to hand - the dashboard's Settings screen only
+       exists client-side). Set to this venue's actual trading timezone;
+       every individual order is bucketed by ITS local trading day via
+       utcToLocalDateStr (not by slicing its raw UTC timestamp - a UTC slice
+       silently misfiles hours of evening/early-morning trade into the wrong
+       day for an AU venue). If the owner ever changes trading timezone,
+       update TZ/ROLLOVER below to match. */
     async scheduledPull(env, h) {
       const host = await this._resolveHost(env, { fresh: true });
       const locationIds = await this._locationIds(env, host);
-      const tz = 'Australia/Sydney';
+      const tz = 'Australia/Adelaide';
+      const rolloverHour = 0;
       const todayStr = new Date().toISOString().slice(0, 10);
 
       const RECENT_DAYS = 70;            /* always keep ~this + last month fresh */
@@ -475,8 +478,8 @@ Object.assign(ADAPTERS, {
       const byDay = {};
       const MAX_PAGES_PER_WINDOW = 20; /* keeps total subrequests well under the per-invocation cap */
       for (const [wFrom, wTo] of windows) {
-        const startAt = localBoundaryToUtc(wFrom, 0, tz);
-        const endAt = localBoundaryToUtc(addDays(wTo, 1), 0, tz);
+        const startAt = localBoundaryToUtc(wFrom, rolloverHour, tz);
+        const endAt = localBoundaryToUtc(addDays(wTo, 1), rolloverHour, tz);
         let cursor = null, pages = 0;
         do {
           const body = {
@@ -494,7 +497,7 @@ Object.assign(ADAPTERS, {
           for (const o of ((data && data.orders) || [])) {
             const closedAt = o.closed_at || o.created_at;
             if (!closedAt || closedAt.length < 10) continue;
-            const day = closedAt.slice(0, 10);
+            const day = utcToLocalDateStr(closedAt, tz, rolloverHour);
             byDay[day] = (byDay[day] || 0) + 1;
           }
           cursor = (data && data.cursor) || null;
@@ -558,6 +561,20 @@ function addDays(dateStr, n) {
   const dt = new Date(Date.UTC(y, m - 1, d));
   dt.setUTCDate(dt.getUTCDate() + n);
   return dt.toISOString().slice(0, 10);
+}
+/* Which TRADING DAY (YYYY-MM-DD, in timeZone, honouring the rollover hour) a
+   UTC instant falls on. Used to bucket individual transactions into the
+   day-store by the venue's own calendar day - NOT by the UTC calendar date,
+   which for an Australian venue silently shifts several hours' worth of
+   evening/early-morning trade into the wrong day (Adelaide/Sydney are ~9.5-11
+   hours ahead of UTC, so anything closed after ~2-3pm UTC is already
+   tomorrow, local time). Mirrors localBoundaryToUtc's rollover semantics. */
+function utcToLocalDateStr(utcIso, timeZone, rolloverHour) {
+  const utcMs = Date.parse(utcIso);
+  const offMin = tzOffsetMinutes(utcMs, timeZone);
+  const local = new Date(utcMs + offMin * 60000); /* "fake UTC" = local wall clock */
+  if (rolloverHour && local.getUTCHours() < rolloverHour) local.setUTCDate(local.getUTCDate() - 1);
+  return local.toISOString().slice(0, 10);
 }
 
 /* ============================================================================
