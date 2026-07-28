@@ -298,12 +298,118 @@ Object.assign(ADAPTERS, {
      connect.squareupsandbox.com.
   */
   pos: {
-    configured: false,
-    auth: null,
+    configured: true,
+    auth: 'token',
     oauth: {},
-    async status(env, h) { return { connected: false }; },
-    async fetchRange(env, h, q) { throw new NotConfigured('pos'); },
-    async fetchMonthly(env, h, q) { throw new NotConfigured('pos'); }
+
+    async _call(env, path, host, init) {
+      const token = env.POS_API_TOKEN || '';
+      const res = await fetch('https://' + host + path, {
+        ...(init || {}),
+        headers: {
+          'Authorization': 'Bearer ' + token,
+          'Square-Version': '2026-06-18',
+          'Content-Type': 'application/json',
+          ...((init && init.headers) || {})
+        }
+      });
+      if (!res.ok) { const e = new Error('HTTP ' + res.status); e.status = res.status; throw e; }
+      return res.json();
+    },
+
+    /* Square's Sandbox/Production toggle produces separate tokens and separate
+       hosts (capability-matrix.md) - try Production first (the expected case
+       once the owner copies a Production token), fall back to Sandbox only so
+       the dashboard can flag it rather than just erroring. status() always
+       re-checks live; fetchRange/fetchMonthly read the cache status() just
+       wrote (status always runs first in apiMetrics). */
+    async _resolveHost(env, opts) {
+      if (!opts || !opts.fresh) {
+        const cached = await env.TOKENS.get('square:host');
+        if (cached) return cached;
+      }
+      try {
+        await this._call(env, '/v2/locations', 'connect.squareup.com');
+        await env.TOKENS.put('square:host', 'connect.squareup.com');
+        return 'connect.squareup.com';
+      } catch (e) {
+        if (e.status === 401 || e.status === 403) {
+          await this._call(env, '/v2/locations', 'connect.squareupsandbox.com');
+          await env.TOKENS.put('square:host', 'connect.squareupsandbox.com');
+          return 'connect.squareupsandbox.com';
+        }
+        throw e;
+      }
+    },
+    async _locationIds(env, host) {
+      const cached = await env.TOKENS.get('square:locations');
+      if (cached) { try { return JSON.parse(cached); } catch (e) {} }
+      const data = await this._call(env, '/v2/locations', host);
+      const ids = ((data && data.locations) || []).map((l) => l.id).filter(Boolean);
+      await env.TOKENS.put('square:locations', JSON.stringify(ids));
+      return ids;
+    },
+    /* Count COMPLETED orders only (excludes voided/cancelled by construction;
+       refunds are separate objects and never subtract from this count),
+       paginating through every page of results. */
+    async _countOrders(env, host, locationIds, startAt, endAt) {
+      let count = 0, cursor = null;
+      do {
+        const body = {
+          location_ids: locationIds,
+          limit: 500,
+          query: {
+            filter: {
+              date_time_filter: { closed_at: { start_at: startAt, end_at: endAt } },
+              state_filter: { states: ['COMPLETED'] }
+            }
+          }
+        };
+        if (cursor) body.cursor = cursor;
+        const data = await this._call(env, '/v2/orders/search', host, { method: 'POST', body: JSON.stringify(body) });
+        count += ((data && data.orders) || []).length;
+        cursor = (data && data.cursor) || null;
+      } while (cursor);
+      return count;
+    },
+
+    async status(env, h) {
+      if (!env.POS_API_TOKEN) return { connected: false };
+      const host = await this._resolveHost(env, { fresh: true });
+      const data = await this._call(env, '/v2/locations', host);
+      const names = ((data && data.locations) || []).map((l) => l.name).filter(Boolean);
+      return { connected: true, org: names.join(', ') || null, sandbox: host.indexOf('sandbox') !== -1 };
+    },
+
+    async fetchRange(env, h, q) {
+      const host = await this._resolveHost(env);
+      const locationIds = await this._locationIds(env, host);
+      const tz = q.tz || 'Australia/Sydney';
+      const rollover = q.rollover || 0;
+      const startAt = localBoundaryToUtc(q.from, rollover, tz);
+      const endAt = localBoundaryToUtc(addDays(q.to, 1), rollover, tz);
+      const count = await this._countOrders(env, host, locationIds, startAt, endAt);
+      return { count };
+    },
+
+    async fetchMonthly(env, h, q) {
+      const host = await this._resolveHost(env);
+      const locationIds = await this._locationIds(env, host);
+      const tz = q.tz || 'Australia/Sydney';
+      const rollover = q.rollover || 0;
+      const months = monthList(q.fromMonth, q.toMonth);
+      const counts = [];
+      for (const mo of months) {
+        const [y, m] = mo.split('-').map(Number);
+        const lastDayNum = new Date(Date.UTC(y, m, 0)).getUTCDate();
+        const firstDay = mo + '-01';
+        const nextMonthFirst = addDays(mo + '-' + String(lastDayNum).padStart(2, '0'), 1);
+        const startAt = localBoundaryToUtc(firstDay, rollover, tz);
+        const endAt = localBoundaryToUtc(nextMonthFirst, rollover, tz);
+        counts.push(await this._countOrders(env, host, locationIds, startAt, endAt));
+      }
+      return { months, count: counts };
+    }
   },
 
   /* >>> ADAPTER 3: ROSTERING (optional - only if the owner has one)
@@ -324,6 +430,39 @@ Object.assign(ADAPTERS, {
     async fetchMonthly(env, h, q) { return { months: [], cost: [] }; }
   }
 });
+
+/* ---------------- Timezone/day-boundary helpers (Square adapter) --------
+   The venue's trading-day rollover (e.g. sales until 4am count to the
+   previous trading day) and timezone matter for the POS count in a way they
+   don't for the accounting P&L (Xero already books each entry to a date in
+   the owner's ledger) - so this math lives here, not in the shared shell. */
+function tzOffsetMinutes(utcMs, timeZone) {
+  const dtf = new Intl.DateTimeFormat('en-US', {
+    timeZone, hourCycle: 'h23',
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit'
+  });
+  const map = {};
+  dtf.formatToParts(new Date(utcMs)).forEach((p) => { if (p.type !== 'literal') map[p.type] = p.value; });
+  const asIfUtc = Date.UTC(+map.year, +map.month - 1, +map.day, +map.hour, +map.minute, +map.second);
+  return Math.round((asIfUtc - utcMs) / 60000);
+}
+/* UTC instant for "hourOffset:00 local wall-clock time on dateStr, in timeZone"
+   (the trading-day rollover boundary). Accurate to the minute; offsets only
+   change at DST transitions, which practically never land exactly on an
+   early-morning rollover hour. */
+function localBoundaryToUtc(dateStr, hourOffset, timeZone) {
+  const [y, m, d] = dateStr.split('-').map(Number);
+  const guessUtc = Date.UTC(y, m - 1, d, hourOffset, 0, 0);
+  const offMin = tzOffsetMinutes(guessUtc, timeZone);
+  return new Date(guessUtc - offMin * 60000).toISOString();
+}
+function addDays(dateStr, n) {
+  const [y, m, d] = dateStr.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  dt.setUTCDate(dt.getUTCDate() + n);
+  return dt.toISOString().slice(0, 10);
+}
 
 /* ============================================================================
    Everything below is the shell. You should rarely need to edit it.
@@ -624,6 +763,13 @@ function setupPage() {
 
 async function authStart(env, source, url) {
   const adapter = ADAPTERS[source];
+  if (adapter && adapter.auth === 'token') {
+    /* Pasted-token sources (e.g. Square) have nothing to "start" in the browser -
+       the paste into Cloudflare Variables and Secrets IS the connection. Just
+       send them back to look at the (already live, if the secret is set)
+       Connections screen rather than a dead-end page. */
+    return Response.redirect(url.origin + '/', 302);
+  }
   if (!adapter || adapter.auth !== 'oauth' || !adapter.oauth.authorizeUrl) {
     return new Response('This connection is not set up for browser authorisation yet.', { status: 404 });
   }
