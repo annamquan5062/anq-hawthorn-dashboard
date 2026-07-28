@@ -1,0 +1,16 @@
+# Your venue dashboard needs ONE thing to go live: a password.
+# When you click "Deploy to Cloudflare", Cloudflare asks you to fill this in.
+# It is kept secret by Cloudflare and never stored in your code.
+
+# Dashboard password — you choose it, and you type it to open your dashboard.
+DASHBOARD_PASSCODE=
+
+# Added later, ONLY for the tools you actually connect. Your AI walks you
+# through adding each one in your Cloudflare dashboard during setup — you do
+# NOT need them now, and they never go in your code:
+#   ACCOUNTING_CLIENT_ID         (e.g. Xero app client id)
+#   ACCOUNTING_CLIENT_SECRET     (e.g. Xero app secret)
+#   POS_API_TOKEN                (e.g. Square access token)
+#   ROSTERING_API_TOKEN          (e.g. Deputy permanent token)
+#   INGEST_TOKEN                 (only if you upload exports instead of a live link)
+# SESSION_SECRET is created automatically on first run — never set it.
