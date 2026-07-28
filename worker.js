@@ -1011,11 +1011,13 @@ async function sourceStatus(env, source) {
 }
 
 async function fetchSlot(env, q) {
-  /* One period slot: pull each configured source; null where unavailable. */
+  /* One period slot: pull each configured source IN PARALLEL (each source is
+     an independent provider - there's no reason to make a slow POS page-scan
+     block an already-finished Xero call), null where unavailable. */
   const out = {};
-  for (const source of ['accounting', 'pos', 'rostering']) {
+  await Promise.all(['accounting', 'pos', 'rostering'].map(async (source) => {
     const adapter = ADAPTERS[source];
-    if (!adapter || !adapter.configured) { out[source] = null; continue; }
+    if (!adapter || !adapter.configured) { out[source] = null; return; }
     try {
       const h = makeHelpers(env, source);
       out[source] = await adapter.fetchRange(env, h, q);
@@ -1023,7 +1025,7 @@ async function fetchSlot(env, q) {
     } catch (err) {
       out[source] = null; /* per-source failure never breaks the whole payload */
     }
-  }
+  }));
   return out;
 }
 
@@ -1062,23 +1064,31 @@ async function apiMetrics(env, url) {
     if (cached) { try { data = JSON.parse(cached); } catch (e) { data = null; } }
   }
   if (!data) {
-    const periods = {};
-    periods.cur = await fetchSlot(env, { ...base, ...cur });
-    periods.prev = prev ? await fetchSlot(env, { ...base, ...prev }) : null;
-    periods.yoy = yoy ? await fetchSlot(env, { ...base, ...yoy }) : null;
-
-    let trendOut = null;
-    if (trend) {
-      trendOut = { months: monthList(trend.fromMonth, trend.toMonth) };
-      for (const source of ['accounting', 'pos']) {
+    /* cur/prev/yoy are three independent period slots and trend is
+       independent of all three - run everything concurrently rather than
+       one after another. This is what actually keeps page load to a few
+       seconds instead of tens of seconds once multiple live sources and
+       comparison periods are all in play. */
+    let trendMonths = trend ? monthList(trend.fromMonth, trend.toMonth) : null;
+    const [curOut, prevOut, yoyOut, trendPairs] = await Promise.all([
+      fetchSlot(env, { ...base, ...cur }),
+      prev ? fetchSlot(env, { ...base, ...prev }) : Promise.resolve(null),
+      yoy ? fetchSlot(env, { ...base, ...yoy }) : Promise.resolve(null),
+      trend ? Promise.all(['accounting', 'pos'].map(async (source) => {
         const adapter = ADAPTERS[source];
-        if (!adapter || !adapter.configured) { trendOut[source] = null; continue; }
+        if (!adapter || !adapter.configured) return [source, null];
         try {
           const h = makeHelpers(env, source);
           const series = await adapter.fetchMonthly(env, h, { ...base, ...trend });
-          trendOut[source] = alignSeries(trendOut.months, series);
-        } catch (err) { trendOut[source] = null; }
-      }
+          return [source, alignSeries(trendMonths, series)];
+        } catch (err) { return [source, null]; }
+      })) : Promise.resolve(null)
+    ]);
+    const periods = { cur: curOut, prev: prevOut, yoy: yoyOut };
+    let trendOut = null;
+    if (trend) {
+      trendOut = { months: trendMonths };
+      trendPairs.forEach(([source, series]) => { trendOut[source] = series; });
     }
     data = { generatedAt: new Date().toISOString(), periods: periods, trend: trendOut };
     if (env.TOKENS) {
