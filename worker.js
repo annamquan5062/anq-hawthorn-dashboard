@@ -935,10 +935,21 @@ async function authCallback(env, source, url) {
 
 /* Day rows live at data:<source>:<YYYY-MM-DD> as JSON objects of numeric
    fields. Same-day re-uploads overwrite (idempotent; re-ingesting a corrected
-   export is safe and expected). */
+   export is safe and expected).
+
+   A trend line spanning many months would otherwise cost one KV read PER DAY
+   in every one of those months (monthlyIngested calling readIngested calling
+   eachDate) - for the dashboard's default 24-month trend that's up to ~750
+   KV reads in a single page load, on top of everything else, which is what
+   was tipping this Worker back over Cloudflare's per-invocation subrequest
+   limit (error 1102) even after the live-POS-scan fix. So every time a day
+   row changes, we also recompute a one-shot "month roll-up" - the month's
+   already-summed totals - so a later trend read only costs ONE KV get per
+   month, not one per day. */
 async function saveIngestedRows(env, source, rows) {
   if (!Array.isArray(rows)) return 0;
   let saved = 0;
+  const touchedMonths = new Set();
   for (const r of rows) {
     if (!r || !/^\d{4}-\d{2}-\d{2}$/.test(r.date || '')) continue;
     const clean = {};
@@ -948,8 +959,17 @@ async function saveIngestedRows(env, source, rows) {
     if (Object.keys(clean).length === 0) continue;
     await env.TOKENS.put('data:' + source + ':' + r.date, JSON.stringify(clean));
     saved++;
+    touchedMonths.add(r.date.slice(0, 7));
   }
+  for (const mo of touchedMonths) await recomputeMonthRollup(env, source, mo);
   return saved;
+}
+
+async function recomputeMonthRollup(env, source, ym) {
+  const [y, m] = ym.split('-').map(Number);
+  const lastDay = new Date(Date.UTC(y, m, 0)).getUTCDate();
+  const r = await readIngested(env, source, ym + '-01', ym + '-' + String(lastDay).padStart(2, '0'));
+  await env.TOKENS.put('monthroll:' + source + ':' + ym, JSON.stringify({ sums: r.sums, daysWithData: r.daysWithData }));
 }
 
 function eachDate(from, to, cap) {
@@ -982,13 +1002,22 @@ async function readIngested(env, source, from, to) {
 }
 
 async function monthlyIngested(env, source, fromMonth, toMonth) {
+  /* Every month that has ever had a day of data written also gets a
+     roll-up written in the SAME call (see saveIngestedRows) - so a missing
+     roll-up genuinely means "the background sync hasn't reached this month
+     yet", not "the data is there but uncomputed". So this reads ONE KV key
+     per month (cheap even for a multi-year trend) and treats a miss as
+     "no data yet" rather than falling back to an expensive per-day scan -
+     that per-day fallback was what re-introduced the subrequest blow-out
+     (up to ~30 KV reads x every month in the trend) this whole roll-up
+     scheme exists to avoid. */
   const months = monthList(fromMonth, toMonth);
   const out = { months, byMonth: [] };
   for (const mo of months) {
-    const [y, m] = mo.split('-').map(Number);
-    const lastDay = new Date(Date.UTC(y, m, 0)).getUTCDate();
-    const r = await readIngested(env, source, mo + '-01', mo + '-' + String(lastDay).padStart(2, '0'));
-    out.byMonth.push(r.daysWithData ? r.sums : null);
+    const rollRaw = await env.TOKENS.get('monthroll:' + source + ':' + mo);
+    let roll = null;
+    if (rollRaw) { try { roll = JSON.parse(rollRaw); } catch (e) { roll = null; } }
+    out.byMonth.push(roll && roll.daysWithData ? roll.sums : null);
   }
   return out;
 }
