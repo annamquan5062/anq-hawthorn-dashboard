@@ -1068,8 +1068,7 @@ function json(obj, status) {
   });
 }
 
-export default {
-  async fetch(request, env) {
+async function handleFetch(request, env) {
     const url = new URL(request.url);
     const path = url.pathname;
 
@@ -1104,6 +1103,23 @@ export default {
       return json({ error: 'unknown source' }, 400);
     }
     return new Response('Not found', { status: 404 });
+}
+
+export default {
+  async fetch(request, env) {
+    /* TEMPORARY diagnostic wrapper: surfaces any uncaught error as JSON
+       (with a debug field) instead of Cloudflare's generic error page, so it
+       can be read directly (e.g. by opening /api/metrics... in a logged-in
+       tab) without needing the Cloudflare Logs UI. Remove once the
+       intermittent-error investigation is closed out. */
+    try {
+      return await handleFetch(request, env);
+    } catch (err) {
+      return new Response(JSON.stringify({
+        error: 'internal',
+        debug: String((err && err.stack) || (err && err.message) || err)
+      }), { status: 500, headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
+    }
   },
 
   /* Cron rung: uncomment [triggers] in wrangler.toml and give any adapter a
