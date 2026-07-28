@@ -436,49 +436,75 @@ Object.assign(ADAPTERS, {
       return { months: r.months, count: r.byMonth.map((s) => (s ? (s.count || 0) : null)) };
     },
 
-    /* Cron rung (wrangler.toml [triggers]): once a day, pull a rolling window
-       of completed-order counts per day into the day-store so fetchMonthly
-       above never has to scan live. Uses a fixed default timezone for the
-       day bucketing (a cron run has no per-request venue timezone/rollover
-       to hand) - a small approximation that only affects the trend line;
-       the reconciled numbers always come from the live, exact fetchRange
-       path above. */
+    /* Cron rung (wrangler.toml [triggers]): once a day, pull completed-order
+       counts per day into the day-store so fetchRange/fetchMonthly above
+       rarely have to scan live. A Worker invocation has a hard subrequest
+       cap (Cloudflare - "Too many subrequests" once exceeded), so this
+       DOESN'T try to pull a whole year in one go: it always resyncs a
+       recent window (keeps this/last month fresh and self-heals any gaps),
+       plus one bounded older chunk per run, walking a persisted cursor
+       further back each time until roughly a year+ of history is covered.
+       Uses a fixed default timezone for the day bucketing (a cron run has
+       no per-request venue timezone/rollover to hand) - a small
+       approximation that only affects the trend line and the not-yet-
+       backfilled older ranges; the reconciled current/recent numbers come
+       from the exact live fetchRange path whenever the day-store hasn't
+       caught up yet. */
     async scheduledPull(env, h) {
       const host = await this._resolveHost(env, { fresh: true });
       const locationIds = await this._locationIds(env, host);
       const tz = 'Australia/Sydney';
       const todayStr = new Date().toISOString().slice(0, 10);
-      const fromStr = addDays(todayStr, -400); /* a little over a year of history */
-      const startAt = localBoundaryToUtc(fromStr, 0, tz);
-      const endAt = localBoundaryToUtc(addDays(todayStr, 1), 0, tz);
+
+      const RECENT_DAYS = 70;            /* always keep ~this + last month fresh */
+      const BACKFILL_TARGET_DAYS = 400;  /* a little over a year, total goal */
+      const BACKFILL_CHUNK_DAYS = 20;    /* how much further back one run reaches */
+
+      const recentFrom = addDays(todayStr, -RECENT_DAYS);
+      const targetDate = addDays(todayStr, -BACKFILL_TARGET_DAYS);
+      const cursor0 = (await env.TOKENS.get('square:backfillCursor')) || recentFrom;
+
+      const windows = [[recentFrom, todayStr]];
+      if (cursor0 > targetDate) {
+        const chunkTo = addDays(cursor0, -1);
+        let chunkFrom = addDays(chunkTo, -(BACKFILL_CHUNK_DAYS - 1));
+        if (chunkFrom < targetDate) chunkFrom = targetDate;
+        if (chunkFrom <= chunkTo) windows.push([chunkFrom, chunkTo]);
+      }
+
       const byDay = {};
-      let cursor = null, pages = 0;
-      const MAX_PAGES = 200; /* a background job, not a page load - room for a full year */
-      do {
-        const body = {
-          location_ids: locationIds,
-          limit: 500,
-          query: {
-            filter: {
-              date_time_filter: { closed_at: { start_at: startAt, end_at: endAt } },
-              state_filter: { states: ['COMPLETED'] }
+      const MAX_PAGES_PER_WINDOW = 20; /* keeps total subrequests well under the per-invocation cap */
+      for (const [wFrom, wTo] of windows) {
+        const startAt = localBoundaryToUtc(wFrom, 0, tz);
+        const endAt = localBoundaryToUtc(addDays(wTo, 1), 0, tz);
+        let cursor = null, pages = 0;
+        do {
+          const body = {
+            location_ids: locationIds,
+            limit: 500,
+            query: {
+              filter: {
+                date_time_filter: { closed_at: { start_at: startAt, end_at: endAt } },
+                state_filter: { states: ['COMPLETED'] }
+              }
             }
+          };
+          if (cursor) body.cursor = cursor;
+          const data = await this._call(env, '/v2/orders/search', host, { method: 'POST', body: JSON.stringify(body) });
+          for (const o of ((data && data.orders) || [])) {
+            const closedAt = o.closed_at || o.created_at;
+            if (!closedAt || closedAt.length < 10) continue;
+            const day = closedAt.slice(0, 10);
+            byDay[day] = (byDay[day] || 0) + 1;
           }
-        };
-        if (cursor) body.cursor = cursor;
-        const data = await this._call(env, '/v2/orders/search', host, { method: 'POST', body: JSON.stringify(body) });
-        for (const o of ((data && data.orders) || [])) {
-          const closedAt = o.closed_at || o.created_at;
-          if (!closedAt || closedAt.length < 10) continue;
-          const day = closedAt.slice(0, 10);
-          byDay[day] = (byDay[day] || 0) + 1;
-        }
-        cursor = (data && data.cursor) || null;
-        pages++;
-        if (pages >= MAX_PAGES && cursor) break;
-      } while (cursor);
+          cursor = (data && data.cursor) || null;
+          pages++;
+          if (pages >= MAX_PAGES_PER_WINDOW && cursor) break;
+        } while (cursor);
+      }
       const rows = Object.keys(byDay).map((date) => ({ date, count: byDay[date] }));
       await h.saveIngestedRows(rows);
+      if (windows.length > 1) await env.TOKENS.put('square:backfillCursor', windows[1][0]);
     }
   },
 
