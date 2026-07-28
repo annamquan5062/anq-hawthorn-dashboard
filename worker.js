@@ -413,61 +413,62 @@ Object.assign(ADAPTERS, {
       return { count };
     },
 
-    /* ONE continuous search spanning the whole requested trend range (rather
-       than one search per month) - far fewer subrequests for a busy venue.
-       Orders are bucketed into months by their closed_at date; this is a
-       small approximation right at a month's edge (a transaction a few
-       minutes either side of midnight could land in the adjacent month's
-       bucket) which is acceptable for a supplementary trend line - the
-       reconciled per-period totals (fetchRange, above) are exact. */
+    /* The trend line reads from the day-store (fast, no live calls at all -
+       protects the page load from ever hitting a resource limit) that
+       scheduledPull() below fills in the background, once a day. Until the
+       first background sync has run, this correctly shows "no data yet" per
+       month rather than a live (and, for a busy venue, expensive) scan - the
+       dashboard's own copy already explains this ("the trend fills in as
+       monthly history comes in"). The reconciled per-period totals
+       (fetchRange, above) are unaffected and stay live + exact. */
     async fetchMonthly(env, h, q) {
-      const host = await this._resolveHost(env);
-      const locationIds = await this._locationIds(env, host);
-      const tz = q.tz || 'Australia/Sydney';
-      const rollover = q.rollover || 0;
-      const months = monthList(q.fromMonth, q.toMonth);
-      if (!months.length) return { months, count: [] };
-      const first = months[0], last = months[months.length - 1];
-      const [ly, lm] = last.split('-').map(Number);
-      const lastDayNum = new Date(Date.UTC(ly, lm, 0)).getUTCDate();
-      const startAt = localBoundaryToUtc(first + '-01', rollover, tz);
-      const endAt = localBoundaryToUtc(addDays(last + '-' + String(lastDayNum).padStart(2, '0'), 1), rollover, tz);
+      const r = await h.monthlyIngested(q.fromMonth, q.toMonth);
+      return { months: r.months, count: r.byMonth.map((s) => (s ? (s.count || 0) : null)) };
+    },
 
-      const key = 'poscache:months:' + startAt + ':' + endAt;
-      let byMonth = null;
-      const cached = await env.TOKENS.get(key);
-      if (cached) { try { byMonth = JSON.parse(cached); } catch (e) {} }
-      if (!byMonth) {
-        byMonth = {};
-        months.forEach((mo) => { byMonth[mo] = 0; });
-        let cursor = null, pages = 0;
-        const MAX_PAGES = 60;
-        do {
-          const body = {
-            location_ids: locationIds,
-            limit: 500,
-            query: {
-              filter: {
-                date_time_filter: { closed_at: { start_at: startAt, end_at: endAt } },
-                state_filter: { states: ['COMPLETED'] }
-              }
+    /* Cron rung (wrangler.toml [triggers]): once a day, pull a rolling window
+       of completed-order counts per day into the day-store so fetchMonthly
+       above never has to scan live. Uses a fixed default timezone for the
+       day bucketing (a cron run has no per-request venue timezone/rollover
+       to hand) - a small approximation that only affects the trend line;
+       the reconciled numbers always come from the live, exact fetchRange
+       path above. */
+    async scheduledPull(env, h) {
+      const host = await this._resolveHost(env, { fresh: true });
+      const locationIds = await this._locationIds(env, host);
+      const tz = 'Australia/Sydney';
+      const todayStr = new Date().toISOString().slice(0, 10);
+      const fromStr = addDays(todayStr, -400); /* a little over a year of history */
+      const startAt = localBoundaryToUtc(fromStr, 0, tz);
+      const endAt = localBoundaryToUtc(addDays(todayStr, 1), 0, tz);
+      const byDay = {};
+      let cursor = null, pages = 0;
+      const MAX_PAGES = 200; /* a background job, not a page load - room for a full year */
+      do {
+        const body = {
+          location_ids: locationIds,
+          limit: 500,
+          query: {
+            filter: {
+              date_time_filter: { closed_at: { start_at: startAt, end_at: endAt } },
+              state_filter: { states: ['COMPLETED'] }
             }
-          };
-          if (cursor) body.cursor = cursor;
-          const data = await this._call(env, '/v2/orders/search', host, { method: 'POST', body: JSON.stringify(body) });
-          for (const o of ((data && data.orders) || [])) {
-            const closedAt = o.closed_at || o.created_at;
-            if (!closedAt || closedAt.length < 7) continue;
-            const mo = closedAt.slice(0, 7);
-            if (mo in byMonth) byMonth[mo]++;
           }
-          cursor = (data && data.cursor) || null;
-          pages++;
-          if (pages >= MAX_PAGES && cursor) break;
-        } while (cursor);
-        await env.TOKENS.put(key, JSON.stringify(byMonth), { expirationTtl: 1800 });
-      }
-      return { months, count: months.map((mo) => (mo in byMonth ? byMonth[mo] : null)) };
+        };
+        if (cursor) body.cursor = cursor;
+        const data = await this._call(env, '/v2/orders/search', host, { method: 'POST', body: JSON.stringify(body) });
+        for (const o of ((data && data.orders) || [])) {
+          const closedAt = o.closed_at || o.created_at;
+          if (!closedAt || closedAt.length < 10) continue;
+          const day = closedAt.slice(0, 10);
+          byDay[day] = (byDay[day] || 0) + 1;
+        }
+        cursor = (data && data.cursor) || null;
+        pages++;
+        if (pages >= MAX_PAGES && cursor) break;
+      } while (cursor);
+      const rows = Object.keys(byDay).map((date) => ({ date, count: byDay[date] }));
+      await h.saveIngestedRows(rows);
     }
   },
 

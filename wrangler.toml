@@ -49,10 +49,10 @@ id = "b46132a21449425999865c65663bfb8e"
 # ----------------------------------------------------------------------------
 
 # ----------------------------------------------------------------------------
-# Cron rung (only when an adapter uses scheduledPull to fetch a tool's own
-# export on a schedule). Uncomment and set a sensible cadence:
-# [triggers]
-# crons = ["0 3 * * *"]   # daily, 3am UTC - adjust to land after the tool's
-#                          # own export runs
+# Cron rung: the POS (Square) adapter's scheduledPull() fills the trend
+# line's day-store in the background once a day, so the dashboard never has
+# to live-scan a full year of transactions during a page load.
+[triggers]
+crons = ["0 16 * * *"]   # daily, 16:00 UTC = 1:30am Adelaide (ACST) - after trading hours
 # ----------------------------------------------------------------------------
 # EOF wrangler.toml
