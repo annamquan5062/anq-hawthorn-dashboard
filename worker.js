@@ -403,6 +403,16 @@ Object.assign(ADAPTERS, {
     },
 
     async fetchRange(env, h, q) {
+      /* Prefer the day-store (instant, no live calls) once scheduledPull has
+         covered every day in this range - falls back to a live (capped,
+         short-cached) count for any range it hasn't reached yet. This is
+         what keeps a busy venue's page load fast once the background sync
+         has run at least once. */
+      const totalDays = eachDate(q.from, q.to).length;
+      const ing = await h.readIngested(q.from, q.to);
+      if (totalDays > 0 && ing.daysWithData >= totalDays) {
+        return { count: ing.sums.count || 0 };
+      }
       const host = await this._resolveHost(env);
       const locationIds = await this._locationIds(env, host);
       const tz = q.tz || 'Australia/Sydney';
@@ -1171,6 +1181,24 @@ async function handleFetch(request, env) {
         return json({ ok: true });
       }
       return json({ error: 'unknown source' }, 400);
+    }
+    if (path === '/api/sync' && (request.method === 'POST' || request.method === 'GET')) {
+      /* Manual trigger for an adapter's background sync (normally only the
+         daily cron calls this) - lets the very first sync happen right away
+         instead of waiting for tonight's scheduled run. Logged-in only. */
+      if (!loggedIn) return json({ error: 'auth' }, 401);
+      const source = url.searchParams.get('source');
+      const adapter = ADAPTERS[source];
+      if (!adapter || typeof adapter.scheduledPull !== 'function') {
+        return json({ error: 'no background sync for this source' }, 400);
+      }
+      try {
+        await adapter.scheduledPull(env, makeHelpers(env, source));
+        await noteSync(env, source);
+        return json({ ok: true });
+      } catch (err) {
+        return json({ error: 'sync failed', debug: String((err && err.message) || err) }, 500);
+      }
     }
     return new Response('Not found', { status: 404 });
 }
