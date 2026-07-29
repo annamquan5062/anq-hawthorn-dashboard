@@ -1272,6 +1272,70 @@ async function handleFetch(request, env) {
         return json({ error: 'sync failed', debug: String((err && err.message) || err) }, 500);
       }
     }
+    if (path === '/api/debug/pos-orders' && request.method === 'GET') {
+      /* TEMPORARY diagnostic route - not part of the kit's normal contract.
+         Lets us see the RAW Square order records for a date range so we can
+         work out exactly why the dashboard's transaction count doesn't match
+         Square's own report, instead of guessing. Remove once that's closed
+         out. Logged-in only; read-only (GET, no writes). */
+      if (!loggedIn) return json({ error: 'auth' }, 401);
+      try {
+        const adapter = ADAPTERS.pos;
+        const from = url.searchParams.get('from');
+        const to = url.searchParams.get('to');
+        const tz = url.searchParams.get('tz') || 'Australia/Adelaide';
+        const rollover = Math.max(0, Math.min(6, parseInt(url.searchParams.get('rollover') || '0', 10) || 0));
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(from || '') || !/^\d{4}-\d{2}-\d{2}$/.test(to || '')) {
+          return json({ error: 'pass ?from=YYYY-MM-DD&to=YYYY-MM-DD' }, 400);
+        }
+        const host = await adapter._resolveHost(env);
+        const locData = await adapter._call(env, '/v2/locations', host);
+        const allLocations = ((locData && locData.locations) || []).map((l) => ({ id: l.id, name: l.name, status: l.status }));
+        const locationIds = await adapter._locationIds(env, host);
+        const startAt = localBoundaryToUtc(from, rollover, tz);
+        const endAt = localBoundaryToUtc(addDays(to, 1), rollover, tz);
+
+        let cursor = null, pages = 0;
+        const byLocation = {};
+        const byState = {};
+        let zeroAmount = 0, withRefundHint = 0, total = 0;
+        const sample = [];
+        do {
+          const body = {
+            location_ids: locationIds,
+            limit: 500,
+            query: { filter: { date_time_filter: { closed_at: { start_at: startAt, end_at: endAt } }, state_filter: { states: ['COMPLETED'] } } }
+          };
+          if (cursor) body.cursor = cursor;
+          const data = await adapter._call(env, '/v2/orders/search', host, { method: 'POST', body: JSON.stringify(body) });
+          for (const o of ((data && data.orders) || [])) {
+            total++;
+            byLocation[o.location_id] = (byLocation[o.location_id] || 0) + 1;
+            byState[o.state] = (byState[o.state] || 0) + 1;
+            const amt = (o.total_money && o.total_money.amount) || 0;
+            if (amt === 0) zeroAmount++;
+            const hasRefundHint = !!(o.refunds && o.refunds.length) || !!(o.returns && o.returns.length) ||
+              JSON.stringify(o).toLowerCase().indexOf('refund') !== -1;
+            if (hasRefundHint) withRefundHint++;
+            if (sample.length < 8) sample.push(o);
+          }
+          cursor = (data && data.cursor) || null;
+          pages++;
+          if (pages >= 40 && cursor) break;
+        } while (cursor);
+
+        return json({
+          from, to, tz, rollover, host,
+          allLocationsOnAccount: allLocations,
+          locationIdsUsedInCount: locationIds,
+          totalCompletedOrders: total,
+          byLocation, byState, zeroAmountOrders: zeroAmount, ordersWithRefundHint: withRefundHint,
+          sampleOrders: sample
+        });
+      } catch (err) {
+        return json({ error: 'debug failed', debug: String((err && err.stack) || (err && err.message) || err) }, 500);
+      }
+    }
     return new Response('Not found', { status: 404 });
 }
 
