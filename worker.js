@@ -1299,7 +1299,9 @@ async function handleFetch(request, env) {
         const byLocation = {};
         const byState = {};
         let zeroAmount = 0, withRefundHint = 0, total = 0;
-        const sample = [];
+        const zeroAmountBySource = {};
+        const zeroAmountByFulfillment = {};
+        const sampleZero = [];
         do {
           const body = {
             location_ids: locationIds,
@@ -1313,11 +1315,35 @@ async function handleFetch(request, env) {
             byLocation[o.location_id] = (byLocation[o.location_id] || 0) + 1;
             byState[o.state] = (byState[o.state] || 0) + 1;
             const amt = (o.total_money && o.total_money.amount) || 0;
-            if (amt === 0) zeroAmount++;
             const hasRefundHint = !!(o.refunds && o.refunds.length) || !!(o.returns && o.returns.length) ||
               JSON.stringify(o).toLowerCase().indexOf('refund') !== -1;
             if (hasRefundHint) withRefundHint++;
-            if (sample.length < 8) sample.push(o);
+            if (amt === 0) {
+              zeroAmount++;
+              const src = (o.source && o.source.name) || 'unknown';
+              zeroAmountBySource[src] = (zeroAmountBySource[src] || 0) + 1;
+              const ful = (o.fulfillments && o.fulfillments[0] && o.fulfillments[0].type) || 'NONE';
+              zeroAmountByFulfillment[ful] = (zeroAmountByFulfillment[ful] || 0) + 1;
+              if (sampleZero.length < 10) {
+                sampleZero.push({
+                  id: o.id,
+                  state: o.state,
+                  source: o.source,
+                  created_at: o.created_at,
+                  closed_at: o.closed_at,
+                  total_money: o.total_money,
+                  net_amount_due_money: o.net_amount_due_money,
+                  line_items: (o.line_items || []).map((li) => ({
+                    name: li.name, quantity: li.quantity, total_money: li.total_money,
+                    gross_sales_money: li.gross_sales_money, total_discount_money: li.total_discount_money
+                  })),
+                  discounts: o.discounts || null,
+                  tenders: (o.tenders || []).map((t) => ({ type: t.type, amount_money: t.amount_money, other_details: t.other_details })),
+                  fulfillments: (o.fulfillments || []).map((f) => ({ type: f.type, state: f.state })),
+                  net_amounts: o.net_amounts
+                });
+              }
+            }
           }
           cursor = (data && data.cursor) || null;
           pages++;
@@ -1330,7 +1356,8 @@ async function handleFetch(request, env) {
           locationIdsUsedInCount: locationIds,
           totalCompletedOrders: total,
           byLocation, byState, zeroAmountOrders: zeroAmount, ordersWithRefundHint: withRefundHint,
-          sampleOrders: sample
+          zeroAmountBySource, zeroAmountByFulfillment,
+          sampleZeroAmountOrders: sampleZero
         });
       } catch (err) {
         return json({ error: 'debug failed', debug: String((err && err.stack) || (err && err.message) || err) }, 500);
