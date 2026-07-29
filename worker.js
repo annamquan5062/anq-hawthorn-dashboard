@@ -1288,115 +1288,12 @@ async function handleFetch(request, env) {
         return json({ error: 'sync failed', debug: String((err && err.message) || err) }, 500);
       }
     }
-    if (path === '/api/debug/pos-orders' && request.method === 'GET') {
-      /* TEMPORARY diagnostic route - not part of the kit's normal contract.
-         Lets us see the RAW Square order records for a date range so we can
-         work out exactly why the dashboard's transaction count doesn't match
-         Square's own report, instead of guessing. Remove once that's closed
-         out. Logged-in only; read-only (GET, no writes). */
-      if (!loggedIn) return json({ error: 'auth' }, 401);
-      try {
-        const adapter = ADAPTERS.pos;
-        const from = url.searchParams.get('from');
-        const to = url.searchParams.get('to');
-        const tz = url.searchParams.get('tz') || 'Australia/Adelaide';
-        const rollover = Math.max(0, Math.min(6, parseInt(url.searchParams.get('rollover') || '0', 10) || 0));
-        if (!/^\d{4}-\d{2}-\d{2}$/.test(from || '') || !/^\d{4}-\d{2}-\d{2}$/.test(to || '')) {
-          return json({ error: 'pass ?from=YYYY-MM-DD&to=YYYY-MM-DD' }, 400);
-        }
-        const host = await adapter._resolveHost(env);
-        const locData = await adapter._call(env, '/v2/locations', host);
-        const allLocations = ((locData && locData.locations) || []).map((l) => ({ id: l.id, name: l.name, status: l.status }));
-        const locationIds = await adapter._locationIds(env, host);
-        const startAt = localBoundaryToUtc(from, rollover, tz);
-        const endAt = localBoundaryToUtc(addDays(to, 1), rollover, tz);
-
-        let cursor = null, pages = 0;
-        const byLocation = {};
-        const byState = {};
-        let zeroAmount = 0, withRefundHint = 0, total = 0;
-        const zeroAmountBySource = {};
-        const zeroAmountByFulfillment = {};
-        const sampleZero = [];
-        do {
-          const body = {
-            location_ids: locationIds,
-            limit: 500,
-            query: { filter: { date_time_filter: { closed_at: { start_at: startAt, end_at: endAt } }, state_filter: { states: ['COMPLETED'] } } }
-          };
-          if (cursor) body.cursor = cursor;
-          const data = await adapter._call(env, '/v2/orders/search', host, { method: 'POST', body: JSON.stringify(body) });
-          for (const o of ((data && data.orders) || [])) {
-            total++;
-            byLocation[o.location_id] = (byLocation[o.location_id] || 0) + 1;
-            byState[o.state] = (byState[o.state] || 0) + 1;
-            const amt = (o.total_money && o.total_money.amount) || 0;
-            const hasRefundHint = !!(o.refunds && o.refunds.length) || !!(o.returns && o.returns.length) ||
-              JSON.stringify(o).toLowerCase().indexOf('refund') !== -1;
-            if (hasRefundHint) withRefundHint++;
-            if (amt === 0) {
-              zeroAmount++;
-              const src = (o.source && o.source.name) || 'unknown';
-              zeroAmountBySource[src] = (zeroAmountBySource[src] || 0) + 1;
-              const ful = (o.fulfillments && o.fulfillments[0] && o.fulfillments[0].type) || 'NONE';
-              zeroAmountByFulfillment[ful] = (zeroAmountByFulfillment[ful] || 0) + 1;
-              if (sampleZero.length < 10) {
-                sampleZero.push({
-                  id: o.id,
-                  state: o.state,
-                  source: o.source,
-                  created_at: o.created_at,
-                  closed_at: o.closed_at,
-                  total_money: o.total_money,
-                  net_amount_due_money: o.net_amount_due_money,
-                  line_items: (o.line_items || []).map((li) => ({
-                    name: li.name, quantity: li.quantity, total_money: li.total_money,
-                    gross_sales_money: li.gross_sales_money, total_discount_money: li.total_discount_money
-                  })),
-                  discounts: o.discounts || null,
-                  tenders: (o.tenders || []).map((t) => ({ type: t.type, amount_money: t.amount_money, other_details: t.other_details })),
-                  fulfillments: (o.fulfillments || []).map((f) => ({ type: f.type, state: f.state })),
-                  net_amounts: o.net_amounts
-                });
-              }
-            }
-          }
-          cursor = (data && data.cursor) || null;
-          pages++;
-          if (pages >= 40 && cursor) break;
-        } while (cursor);
-
-        return json({
-          from, to, tz, rollover, host,
-          allLocationsOnAccount: allLocations,
-          locationIdsUsedInCount: locationIds,
-          totalCompletedOrders: total,
-          byLocation, byState, zeroAmountOrders: zeroAmount, ordersWithRefundHint: withRefundHint,
-          zeroAmountBySource, zeroAmountByFulfillment,
-          sampleZeroAmountOrders: sampleZero
-        });
-      } catch (err) {
-        return json({ error: 'debug failed', debug: String((err && err.stack) || (err && err.message) || err) }, 500);
-      }
-    }
     return new Response('Not found', { status: 404 });
 }
 
 export default {
   async fetch(request, env) {
-    /* TEMPORARY diagnostic wrapper: surfaces any uncaught error as JSON
-       (with a debug field) instead of Cloudflare's generic error page, so it
-       can be read directly (e.g. by opening /api/metrics... in a logged-in
-       tab) without needing the Cloudflare Logs UI. Remove once the
-       intermittent-error investigation is closed out. */
-    try {
-      return await handleFetch(request, env);
-    } catch (err) {
-      return new Response(JSON.stringify({
-        error: 'internal',
-        debug: String((err && err.stack) || (err && err.message) || err)
-      }), { status: 500, headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
-    }
+    return handleFetch(request, env);
   },
 
   /* Cron rung: uncomment [triggers] in wrangler.toml and give any adapter a
