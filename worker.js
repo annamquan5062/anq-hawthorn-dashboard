@@ -283,6 +283,21 @@ function plMultiPeriod(rows, nPeriods, chunkMonthsAscending) {
   return out;
 }
 
+/* A Square order can carry `state: "COMPLETED"` at the top level even when
+   nothing was ever sold: an abandoned/cleared ticket with no items and no
+   payment, whose own fulfillment is separately marked CANCELED. Confirmed via
+   live diagnostic data on 2026-07-29 (see /api/debug/pos-orders samples) -
+   every $0 order pulled had empty line_items, no tenders, and a CANCELED
+   fulfillment. That's a void in substance, not a completed transaction
+   (kpi-spec.md: "voids... excluded"), and it's what was inflating the
+   dashboard's transaction count ~12-15% above Square's own reports. A real
+   sale always has a positive total, so filtering on that alone correctly
+   excludes these without needing to special-case every possible empty-order
+   shape. */
+function isRealSaleOrder(o) {
+  return !!(o && o.total_money && o.total_money.amount > 0);
+}
+
 Object.assign(ADAPTERS, {
   /* >>> ADAPTER 2: POS
      Contract:
@@ -371,7 +386,7 @@ Object.assign(ADAPTERS, {
         };
         if (cursor) body.cursor = cursor;
         const data = await this._call(env, '/v2/orders/search', host, { method: 'POST', body: JSON.stringify(body) });
-        count += ((data && data.orders) || []).length;
+        for (const o of ((data && data.orders) || [])) { if (isRealSaleOrder(o)) count++; }
         cursor = (data && data.cursor) || null;
         pages++;
         if (pages >= cap && cursor) { capped = true; break; }
@@ -495,6 +510,7 @@ Object.assign(ADAPTERS, {
           if (cursor) body.cursor = cursor;
           const data = await this._call(env, '/v2/orders/search', host, { method: 'POST', body: JSON.stringify(body) });
           for (const o of ((data && data.orders) || [])) {
+            if (!isRealSaleOrder(o)) continue;
             const closedAt = o.closed_at || o.created_at;
             if (!closedAt || closedAt.length < 10) continue;
             const day = utcToLocalDateStr(closedAt, tz, rolloverHour);
